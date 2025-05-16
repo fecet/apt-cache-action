@@ -1,4 +1,4 @@
-name: 'Apt-Cache-Action'
+name: "Apt-Cache-Action"
 description: Cache Apt Packages
 author: Eeems
 branding:
@@ -12,31 +12,57 @@ inputs:
     description: Location to cache deb files
     required: false
     default: .aptcache
+
 runs:
   using: composite
   steps:
-    - name: Setup Apt for caching
+    # 1. 计算版本 Hash 并导出
+    - name: Compute Apt Hash
+      id: hash
       shell: bash
       run: |
-        sudo apt-get update -yq
-        aptHash(){ echo "$1-$(apt-cache policy "$1" | grep -oP '(?<=Candidate:\s)(.+)')"; }
+        apt-get update -yq
+        aptHash() { echo "$1-$(apt-cache policy "$1" \
+                   | grep -oP '(?<=Candidate:\s)(.+)')"; }
         export -f aptHash
-        hash=$(echo "${{ inputs.packages }}" | xargs -rI {} bash -c 'aptHash {}' | tr '\n' '-' | md5sum | cut -f 1 -d ' ')
-        echo "packagesHash=${hash}" >> $GITHUB_ENV
-    - name: Cache deb files
+        hash=$(echo "${{ inputs.packages }}" \
+               | xargs -rI {} bash -c 'aptHash {}' \
+               | tr '\n' '-' \
+               | md5sum \
+               | cut -f1 -d' ')
+        echo "::set-output name=hash::$hash"
+
+    # 2. 恢复上次的 .deb 缓存
+    - name: Restore Apt Cache
+      id: cache
       uses: actions/cache@v4
       with:
         path: ${{ inputs.path }}
-        key: apt-cache-${{ env.packagesHash }}
+        key: apt-cache-${{ steps.hash.outputs.hash }}
         restore-keys: |
           apt-cache-
-    - name: Restore deb files from cache
+
+    # 3. 如果缓存命中，把 .deb 放回 apt 的缓存目录
+    - name: Populate APT cache from backup
+      if: steps.cache.outputs.cache-hit == 'true'
       shell: bash
       run: |
-        sudo apt-get clean -yq
-        if compgen -G "${{ inputs.path }}/*.deb" > /dev/null; then
-          sudo cp -l ${{ inputs.path }}/*.deb /var/cache/apt/archives
-        fi
-        sudo apt-get install -yq ${{ inputs.packages }}
-        mkdir -p ${{ inputs.path }}
-        sudo cp -l /var/cache/apt/archives/*.deb ${{ inputs.path }}
+        cp "${{ inputs.path }}"/*.deb /var/cache/apt/archives/
+
+    # 4. 更新源、安装（会优先用本地 .deb）
+    - name: Install Packages
+      shell: bash
+      run: |
+        apt-get update -yq
+        apt-get install -yq ${{ inputs.packages }}
+
+    - name: Save APT cache files
+      if: always()
+      shell: bash
+      run: |
+        mkdir -p "${{ inputs.path }}"
+        cp /var/cache/apt/archives/*.deb "${{ inputs.path }}/" || true
+        echo ">>> files now in cache dir:"
+        ls -1 "${{ inputs.path }}/" || echo "(empty)"
+
+    # （post 阶段会自动把 inputs.path 下的文件再缓存起来）
